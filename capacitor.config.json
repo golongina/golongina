@@ -1,0 +1,8 @@
+{
+  "appId": "com.golongina.metrobocegi",
+  "appName": "Metro Böceği",
+  "webDir": "www",
+  "backgroundColor": "#0e0c0a",
+  "android": { "backgroundColor": "#0e0c0a" },
+  "ios": { "backgroundColor": "#0e0c0a", "contentInset": "never", "scrollEnabled": false }
+}

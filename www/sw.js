@@ -1,0 +1,45 @@
+// Offline cache so the game works without a connection after the first visit.
+const CACHE = 'metro-bocegi-v1';
+const ASSETS = [
+  './fonts/barlow-latin-400-normal.woff2',
+  './fonts/barlow-latin-600-normal.woff2',
+  './fonts/barlow-latin-700-normal.woff2',
+  './fonts/barlow-latin-ext-400-normal.woff2',
+  './fonts/barlow-latin-ext-600-normal.woff2',
+  './fonts/barlow-latin-ext-700-normal.woff2',
+  './fonts/big-shoulders-display-latin-700-normal.woff2',
+  './fonts/big-shoulders-display-latin-900-normal.woff2',
+  './fonts/big-shoulders-display-latin-ext-700-normal.woff2',
+  './fonts/big-shoulders-display-latin-ext-900-normal.woff2',
+  './fonts/fonts.css',
+  './icons/apple-touch-icon.png',
+  './icons/icon-192.png',
+  './icons/icon-512.png',
+  './icons/icon-maskable-512.png',
+  './',
+  './manifest.webmanifest',
+  './vendor/three/addons/environments/RoomEnvironment.js',
+  './vendor/three/addons/postprocessing/EffectComposer.js',
+  './vendor/three/addons/postprocessing/MaskPass.js',
+  './vendor/three/addons/postprocessing/OutputPass.js',
+  './vendor/three/addons/postprocessing/Pass.js',
+  './vendor/three/addons/postprocessing/RenderPass.js',
+  './vendor/three/addons/postprocessing/ShaderPass.js',
+  './vendor/three/addons/postprocessing/UnrealBloomPass.js',
+  './vendor/three/addons/shaders/CopyShader.js',
+  './vendor/three/addons/shaders/LuminosityHighPassShader.js',
+  './vendor/three/addons/shaders/OutputShader.js',
+  './vendor/three/three.module.js'
+];
+self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting())); });
+self.addEventListener('activate', e => {
+  e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim()));
+});
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET') return;
+  if (e.request.mode === 'navigate') { // fresh page when online, cached page when offline
+    e.respondWith(fetch(e.request).catch(() => caches.match('./')));
+    return;
+  }
+  e.respondWith(caches.match(e.request, { ignoreSearch: true }).then(hit => hit || fetch(e.request)));
+});

@@ -1,0 +1,22 @@
+{
+  "name": "metro-bocegi",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hamam böceğiyle metro tünelinde 3D sonsuz koşu oyunu (iOS, Android, web).",
+  "scripts": {
+    "serve": "npx --yes http-server www -p 8080 -c-1",
+    "sync": "npx cap sync",
+    "android": "npx cap sync android && npx cap open android",
+    "ios": "npx cap sync ios && npx cap open ios",
+    "assets": "npx capacitor-assets generate --iconBackgroundColor '#0e0c0a' --iconBackgroundColorDark '#0e0c0a' --splashBackgroundColor '#0e0c0a' --splashBackgroundColorDark '#0e0c0a'"
+  },
+  "devDependencies": {
+    "@capacitor/assets": "^3.0.5",
+    "@capacitor/cli": "^6.2.3"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.2.3",
+    "@capacitor/core": "^6.2.3",
+    "@capacitor/ios": "^6.2.3"
+  }
+}

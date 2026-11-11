@@ -1,0 +1,30 @@
+name: iOS build check
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx cap sync ios
+      - name: Build for iOS Simulator (no signing needed)
+        run: |
+          xcodebuild -workspace ios/App/App.xcworkspace -scheme App \
+            -configuration Debug -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Zip simulator app
+        run: cd build/Build/Products/Debug-iphonesimulator && zip -qr ../../../../MetroBocegi-simulator.zip App.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metro-bocegi-ios-simulator
+          path: MetroBocegi-simulator.zip

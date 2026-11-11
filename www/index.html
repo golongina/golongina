@@ -169,6 +169,10 @@ import { EffectComposer } from './vendor/three/addons/postprocessing/EffectCompo
 import { RenderPass } from './vendor/three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from './vendor/three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from './vendor/three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from './vendor/three/addons/postprocessing/ShaderPass.js';
+import { GTAOPass } from './vendor/three/addons/postprocessing/GTAOPass.js';
+import { RGBELoader } from './vendor/three/addons/loaders/RGBELoader.js';
+import { RoundedBoxGeometry } from './vendor/three/addons/geometries/RoundedBoxGeometry.js';
 
 // ───────────────────────────── constants ─────────────────────────────
 const LANES = [-2.6, 0, 2.6];
@@ -196,8 +200,8 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPrefere
 let dpr = Math.min(window.devicePixelRatio || 1, isTouch ? 1.35 : 1.75);
 renderer.setPixelRatio(dpr);
 renderer.setSize(innerWidth, innerHeight);
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.15;
+renderer.toneMapping = THREE.AgXToneMapping;   // filmic response close to a camera sensor
+renderer.toneMappingExposure = 1.2;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = isTouch ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
 const MAX_ANISO = renderer.capabilities.getMaxAnisotropy();
@@ -209,6 +213,10 @@ scene.fog = new THREE.FogExp2(FOG_COLOR, 0.0165);
 
 const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
+// real captured light (CC0 HDRI of a concrete underpass) for reflections once it has loaded
+new RGBELoader().load('env/pedestrian_overpass_1k.hdr', hdr => {
+  scene.environment = pmrem.fromEquirectangular(hdr).texture; hdr.dispose();
+}, undefined, () => {});
 
 const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.05, 260);
 camera.position.set(2.4, 1.3, 2.6);
@@ -217,9 +225,38 @@ const composer = new EffectComposer(renderer);
 composer.setPixelRatio(dpr);
 composer.setSize(innerWidth, innerHeight);
 composer.addPass(new RenderPass(scene, camera));
-const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.55, 0.55, 0.9);
+// ground-truth ambient occlusion: contact shadows under rails, stones, legs (desktop only, too heavy for phones)
+let gtao = null;
+if (!isTouch) {
+  gtao = new GTAOPass(scene, camera, innerWidth, innerHeight);
+  gtao.updateGtaoMaterial({ radius: 0.5, distanceExponent: 1.5, thickness: 1.5, scale: 1.2, samples: 12 });
+  gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 6, rings: 2, samples: 12 });
+  gtao.blendIntensity = 0.85;
+  composer.addPass(gtao);
+}
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.42, 0.6, 0.92);
 composer.addPass(bloom);
 composer.addPass(new OutputPass());
+// camera look: lens vignette, slight chromatic aberration at the edges, sensor grain, gentle contrast curve
+const lens = new ShaderPass({
+  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uGrain: { value: isTouch ? 0.035 : 0.045 } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform float uTime; uniform float uGrain; varying vec2 vUv;
+    float hash(vec2 p){ p = fract(p * vec2(443.897, 441.423)); p += dot(p, p.yx + 19.19); return fract((p.x + p.y) * p.x); }
+    void main(){
+      vec2 d = vUv - 0.5; float r2 = dot(d, d);
+      vec2 off = d * r2 * 0.012;
+      vec3 c = vec3(texture2D(tDiffuse, vUv + off).r, texture2D(tDiffuse, vUv).g, texture2D(tDiffuse, vUv - off).b);
+      c = mix(c, c * c * (3.0 - 2.0 * c), 0.4);                 // S-curve contrast
+      c *= vec3(1.03, 1.0, 0.95);                                // warm sodium grade
+      c *= mix(1.0, 0.45, smoothstep(0.12, 0.7, r2 * 1.6));      // lens vignette
+      float g = hash(vUv * 1024.0 + fract(uTime * 7.3) * 100.0) - 0.5;
+      c += g * uGrain * (1.0 - dot(c, vec3(0.3, 0.5, 0.2)) * 0.6);
+      gl_FragColor = vec4(c, 1.0);
+    }`
+});
+composer.addPass(lens);
 
 // ───────────────────────────── lights ─────────────────────────────
 scene.add(new THREE.HemisphereLight(0xb7c4d6, 0x2a1e14, 0.55));
@@ -532,44 +569,70 @@ const dotC = makeCanvas(32, 32, (g, w) => {
   rg.addColorStop(0, 'rgba(255,240,220,1)'); rg.addColorStop(1, 'rgba(255,240,220,0)'); g.fillStyle = rg; g.fillRect(0, 0, w, w);
 });
 
+// ───────────────────────────── scanned-style PBR texture sets (tools/gen_textures.py) ─────────────────────────────
+const texLoader = new THREE.TextureLoader();
+const texCache = {};
+function loadTex(file, rx, ry, srgb) {
+  const t = texLoader.load('textures/' + file);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(rx, ry); t.anisotropy = MAX_ANISO;
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+// returns material params: albedo, normal, and one packed map for AO (R) / roughness (G) / metalness (B)
+function pbr(name, rx = 1, ry = 1, { albedo = true, metal = false, normalScale = 1 } = {}) {
+  const arm = loadTex(name + '_arm.jpg', rx, ry, false);
+  const o = { normalMap: loadTex(name + '_normal.jpg', rx, ry, false), normalScale: new THREE.Vector2(normalScale, normalScale), aoMap: arm, aoMapIntensity: 1, roughnessMap: arm, roughness: 1 };
+  if (albedo) o.map = loadTex(name + '_albedo.jpg', rx, ry, true);
+  if (metal) { o.metalnessMap = arm; o.metalness = 1; }
+  return o;
+}
+
 // ───────────────────────────── materials ─────────────────────────────
 const M = {
-  concrete: new THREE.MeshStandardMaterial({ map: tex(concreteC, 6, 6), bumpMap: tex(concreteC, 6, 6, false), bumpScale: 3, roughness: 0.95, side: THREE.BackSide, envMapIntensity: 0.25 }),
-  tiles: new THREE.MeshStandardMaterial({ map: tex(tileC, 6, 1), bumpMap: tex(tileC, 6, 1, false), bumpScale: 1.5, roughness: 0.35, envMapIntensity: 0.5 }),
-  kick: new THREE.MeshStandardMaterial({ map: tex(concreteC, 6, 0.3), color: 0x5a524a, roughness: 1, envMapIntensity: 0.2 }),
-  ballast: new THREE.MeshStandardMaterial({ map: tex(ballastC, 4, 8), bumpMap: tex(ballastC, 4, 8, false), bumpScale: 5, roughness: 0.95, envMapIntensity: 0.2 }),
-  wood: new THREE.MeshStandardMaterial({ map: tex(woodC), bumpMap: tex(woodC, 1, 1, false), bumpScale: 2, roughness: 0.9, envMapIntensity: 0.2 }),
-  railBase: new THREE.MeshStandardMaterial({ map: tex(rustC, 1, 12), color: 0x8a7464, metalness: 0.75, roughness: 0.7, envMapIntensity: 0.6 }),
-  railTop: new THREE.MeshStandardMaterial({ color: 0x9a9690, metalness: 1, roughness: 0.32, envMapIntensity: 0.45 }),
-  rust: new THREE.MeshStandardMaterial({ map: tex(rustC, 2, 2), bumpMap: tex(bumpC, 2, 2, false), bumpScale: 2, metalness: 0.6, roughness: 0.75, envMapIntensity: 0.5 }),
+  concrete: new THREE.MeshStandardMaterial({ ...pbr('concrete', 5, 6, { normalScale: 1.4 }), side: THREE.BackSide, envMapIntensity: 0.25 }),
+  tiles: new THREE.MeshStandardMaterial({ ...pbr('tiles', 6, 1), envMapIntensity: 0.55 }),
+  kick: new THREE.MeshStandardMaterial({ ...pbr('concrete', 6, 0.3), color: 0x6a625a, envMapIntensity: 0.2 }),
+  ballast: new THREE.MeshStandardMaterial({ ...pbr('ballast', 5, 9.5, { normalScale: 1.6 }), envMapIntensity: 0.25 }),
+  stone: new THREE.MeshStandardMaterial({ ...pbr('concrete', 1, 1, { albedo: false, normalScale: 2 }), color: 0x4a4643, envMapIntensity: 0.3 }),
+  wood: new THREE.MeshStandardMaterial({ ...pbr('wood', 1, 1, { normalScale: 1.5 }), envMapIntensity: 0.2 }),
+  railBase: new THREE.MeshStandardMaterial({ ...pbr('rust', 1, 30, { metal: true }), envMapIntensity: 0.6 }),
+  railTop: new THREE.MeshStandardMaterial({ color: 0xb4b0aa, metalness: 1, roughness: 0.22, envMapIntensity: 0.8 }),
+  rust: new THREE.MeshStandardMaterial({ ...pbr('rust', 2, 6, { metal: true }), envMapIntensity: 0.6 }),
   cable: new THREE.MeshStandardMaterial({ color: 0x141414, roughness: 0.5, envMapIntensity: 0.6 }),
   lampHousing: new THREE.MeshStandardMaterial({ color: 0x2c2a26, metalness: 0.7, roughness: 0.5 }),
   lampGlass: new THREE.MeshStandardMaterial({ color: 0xffc77a, emissive: 0xffb45c, emissiveIntensity: 5 }),
   tube: new THREE.MeshStandardMaterial({ color: 0xe8f0ff, emissive: 0xdfe8ff, emissiveIntensity: 3.2 }),
   puddle: new THREE.MeshPhysicalMaterial({ color: 0x0b0a08, roughness: 0.04, metalness: 0.1, clearcoat: 1, transparent: true, opacity: 0.85, envMapIntensity: 1.2 }),
-  trainBody: trainSideTexs.map(t => new THREE.MeshStandardMaterial({ map: t, metalness: 0.65, roughness: 0.38, envMapIntensity: 1.1 })),
+  trainBody: trainSideTexs.map(t => new THREE.MeshStandardMaterial({ ...pbr('trainmetal', 1, 1, { albedo: false, metal: true }), map: t, envMapIntensity: 1.0 })),
   trainEnd: new THREE.MeshStandardMaterial({ color: 0xb3b6ba, metalness: 0.7, roughness: 0.35, envMapIntensity: 1 }),
   trainRoof: new THREE.MeshStandardMaterial({ color: 0x6d6e70, map: tex(bumpC, 4, 1), metalness: 0.6, roughness: 0.6 }),
   under: new THREE.MeshStandardMaterial({ color: 0x1a1816, metalness: 0.5, roughness: 0.8 }),
   glass: new THREE.MeshPhysicalMaterial({ color: 0x0b1116, metalness: 0.2, roughness: 0.05, clearcoat: 1, envMapIntensity: 1.4 }),
-  window: new THREE.MeshStandardMaterial({ color: 0xcfe0f0, emissive: 0xbfd6f2, emissiveIntensity: 1.6, roughness: 0.2 }),
+  window: (() => { const t = tex(makeCanvas(256, 180, (g, w, h) => { // carriage interior seen through glass
+      const gr = g.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, '#f4f2e6'); gr.addColorStop(0.25, '#c9cdc4'); gr.addColorStop(1, '#5d6662'); g.fillStyle = gr; g.fillRect(0, 0, w, h);
+      g.fillStyle = '#fffbe8'; g.fillRect(0, 6, w, 10);                                   // ceiling light strip
+      g.fillStyle = '#2f5a8a'; for (let x = 10; x < w; x += 62) { g.fillRect(x, h * 0.62, 48, h * 0.38); g.fillRect(x, h * 0.48, 48, h * 0.16); } // seats
+      g.fillStyle = '#d8d8d0'; for (let x = 40; x < w; x += 124) g.fillRect(x, 16, 4, h);  // grab poles
+      g.fillStyle = 'rgba(30,30,30,0.55)'; for (let x = 70; x < w; x += 120) g.fillRect(x, h * 0.3, 18, h * 0.5);  // a few standing figures
+      g.fillStyle = 'rgba(255,255,255,0.12)'; g.beginPath(); g.moveTo(0, h); g.lineTo(80, 0); g.lineTo(130, 0); g.lineTo(50, h); g.fill(); // glass reflection
+    })); return new THREE.MeshStandardMaterial({ map: t, emissiveMap: t, emissive: 0xffffff, emissiveIntensity: 1.25, roughness: 0.05, metalness: 0.1 }); })(),
   headlight: new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xfff2cc, emissiveIntensity: 14 }),
   destSign: null,
   stripe: new THREE.MeshStandardMaterial({ map: tex(stripeC), roughness: 0.4, envMapIntensity: 0.7 }),
   hazard: new THREE.MeshStandardMaterial({ map: tex(hazardC, 2, 1), roughness: 0.6 }),
-  darkMetal: new THREE.MeshStandardMaterial({ color: 0x2b2a28, metalness: 0.8, roughness: 0.45 }),
+  darkMetal: new THREE.MeshStandardMaterial({ ...pbr('rust', 1, 1, { albedo: false }), color: 0x2b2a28, metalness: 0.8 }),
   fence: new THREE.MeshStandardMaterial({ map: tex(fenceC, 3, 3.5), alphaTest: 0.5, metalness: 0.8, roughness: 0.4, side: THREE.DoubleSide, envMapIntensity: 0.8 }),
   spray: new THREE.MeshStandardMaterial({ map: tex(sprayC), metalness: 0.55, roughness: 0.3, envMapIntensity: 1 }),
   chrome: new THREE.MeshStandardMaterial({ color: 0xd8d8d8, metalness: 1, roughness: 0.15 }),
   whitePlastic: new THREE.MeshPhysicalMaterial({ color: 0xf0f0ea, roughness: 0.35, clearcoat: 0.5 }),
-  crumb: new THREE.MeshStandardMaterial({ map: tex(crumbC), bumpMap: tex(crumbC, 1, 1, false), bumpScale: 3, roughness: 0.85, emissive: 0x6b3a0c, emissiveIntensity: 0.7 }),
-  glow: new THREE.SpriteMaterial({ map: tex(glowC), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.7, fog: true }),
+  crumb: new THREE.MeshStandardMaterial({ map: tex(crumbC), bumpMap: tex(crumbC, 1, 1, false), bumpScale: 4, roughness: 0.9, emissive: 0x6b3a0c, emissiveIntensity: 0.35 }),
+  glow: new THREE.SpriteMaterial({ map: tex(glowC), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.32, fog: true }),
   // roach
-  shell: new THREE.MeshPhysicalMaterial({ map: tex(wingC), color: 0x9a6a50, roughness: 0.4, clearcoat: 1, clearcoatRoughness: 0.12, envMapIntensity: 0.35 }),
-  pronotum: new THREE.MeshPhysicalMaterial({ map: tex(pronotumC), color: 0xb08a70, roughness: 0.38, clearcoat: 1, clearcoatRoughness: 0.12, envMapIntensity: 0.35 }),
-  abdomen: new THREE.MeshPhysicalMaterial({ map: tex(abdomenC, 1, 1), roughness: 0.45, clearcoat: 0.6, clearcoatRoughness: 0.25, envMapIntensity: 0.35 }),
-  chitin: new THREE.MeshPhysicalMaterial({ color: 0x2a1207, roughness: 0.38, clearcoat: 0.8, clearcoatRoughness: 0.2, envMapIntensity: 0.35 }),
-  leg: new THREE.MeshPhysicalMaterial({ color: 0x4a220d, roughness: 0.42, clearcoat: 0.7, clearcoatRoughness: 0.25, envMapIntensity: 0.35 }),
+  shell: new THREE.MeshPhysicalMaterial({ ...pbr('wing'), color: 0x7c5a4c, roughness: 1, clearcoat: 0.75, clearcoatRoughness: 0.28, envMapIntensity: 0.3 }),
+  pronotum: new THREE.MeshPhysicalMaterial({ ...pbr('chitin', 2, 2, { albedo: false }), map: tex(pronotumC), color: 0x94705a, clearcoat: 0.75, clearcoatRoughness: 0.25, envMapIntensity: 0.3 }),
+  abdomen: new THREE.MeshPhysicalMaterial({ ...pbr('chitin', 2, 2, { albedo: false }), map: tex(abdomenC, 1, 1), clearcoat: 0.6, clearcoatRoughness: 0.25, envMapIntensity: 0.35 }),
+  chitin: new THREE.MeshPhysicalMaterial({ ...pbr('chitin', 3, 3, { albedo: false }), color: 0x2a1207, clearcoat: 0.8, clearcoatRoughness: 0.2, envMapIntensity: 0.35 }),
+  leg: new THREE.MeshPhysicalMaterial({ ...pbr('chitin', 1, 4, { albedo: false }), color: 0x3a1a0b, clearcoat: 0.7, clearcoatRoughness: 0.3, envMapIntensity: 0.3 }),
   eye: new THREE.MeshPhysicalMaterial({ color: 0x080404, roughness: 0.1, clearcoat: 1 }),
   hindWing: new THREE.MeshPhysicalMaterial({ map: tex(hindWingC), transparent: true, opacity: 0.75, roughness: 0.2, side: THREE.DoubleSide, depthWrite: false, clearcoat: 1 }),
   // slipper
@@ -603,6 +666,7 @@ function limbZ(rt, rb, len, seg = 8) { const g = new THREE.CylinderGeometry(rt, 
 const mesh = (g, m) => new THREE.Mesh(g, m);
 
 // ───────────────────────────── cockroach ─────────────────────────────
+const SPINE_GEO = new THREE.ConeGeometry(0.0035, 0.055, 4).translate(0, 0.0275, 0);
 function buildRoach() {
   const root = new THREE.Group();           // follows player position
   const body = new THREE.Group(); root.add(body); // bobbing / squash
@@ -623,9 +687,9 @@ function buildRoach() {
   for (const s of [-1, 1]) {
     let parent = new THREE.Group(); parent.position.set(s * 0.05, 0.27, -0.74); parent.rotation.set(0.35, s * 0.32, 0); body.add(parent);
     const segs = [];
-    const N = 18;
+    const N = 30;
     for (let i = 0; i < N; i++) {
-      const len = 0.075, r0 = 0.011 * (1 - i / N) + 0.003, r1 = 0.011 * (1 - (i + 1) / N) + 0.003;
+      const len = i < 2 ? 0.05 : 0.058, r0 = 0.0085 * (1 - i / N) + 0.0018, r1 = 0.0085 * (1 - (i + 1) / N) + 0.0018;
       const seg = new THREE.Group(); if (i) seg.position.z = -len;
       seg.add(mesh(limbZ(r1, r0, len, 6), M.leg));
       parent.add(seg); segs.push(seg); parent = seg;
@@ -651,7 +715,13 @@ function buildRoach() {
   const wings = [];
   for (const s of [-1, 1]) {
     const pivot = new THREE.Group(); pivot.position.set(s * 0.04, 0.36, -0.26); body.add(pivot);
-    const g = ellipsoid(0.165, 0.032, 0.66, 36, 18); planarUV(g, 'x', 'z');
+    const g = ellipsoid(0.17, 0.026, 0.68, 48, 24);
+    { // drape the wing over the abdomen: outer edge curls down, tip flattens
+      const p = g.attributes.position;
+      for (let i = 0; i < p.count; i++) { const x = p.getX(i), z = p.getZ(i); p.setY(i, p.getY(i) - 2.4 * x * x * (1 - 0.3 * z / 0.68) - (s * x > 0 ? 0.6 * x * x : 0)); }
+      g.computeVertexNormals();
+    }
+    planarUV(g, 'x', 'z');
     const w = mesh(g, M.shell); w.position.set(s * 0.07, s * 0.004, 0.55); w.rotation.set(0.06, s * -0.06, s * -0.05); pivot.add(w);
     // membranous hind wing, hidden until flight
     const hwShape = new THREE.Shape(); hwShape.moveTo(0, 0); hwShape.bezierCurveTo(0.5, 0.15, 0.9, 0.05, 1.0, -0.3); hwShape.bezierCurveTo(0.8, -0.7, 0.3, -0.75, 0, -0.1);
@@ -677,12 +747,19 @@ function buildRoach() {
     const fm = mesh(limbX(0.02, 0.032, c.femur), M.leg); fm.scale.z = 0.7; fem.add(fm);
     const tib = new THREE.Group(); tib.position.x = c.femur; tib.rotation.z = c.tib; fem.add(tib);
     tib.add(mesh(limbX(0.01, 0.018, c.tibia), M.leg));
-    for (let k = 1; k <= 4; k++) { // spines
-      const sp = mesh(new THREE.ConeGeometry(0.005, 0.05, 4), M.chitin);
-      sp.position.set(c.tibia * k / 5, -0.012, (k % 2 ? 1 : -1) * 0.01); sp.rotation.z = 2.3; tib.add(sp);
+    for (let k = 1; k <= 9; k++) { // the stiff spines that make roach legs look like bottle brushes
+      const sp = mesh(SPINE_GEO, M.chitin);
+      sp.position.set(c.tibia * k / 10, (k % 3 - 1) * 0.008, (k % 2 ? 1 : -1) * 0.012);
+      sp.rotation.set((k % 2 ? 1 : -1) * 0.5, 0, 2.25 + (k % 3) * 0.12); tib.add(sp);
     }
+    for (let k = 1; k <= 3; k++) { const sp = mesh(SPINE_GEO, M.chitin); sp.scale.setScalar(0.6); sp.position.set(c.femur * (0.4 + k * 0.17), -0.018, 0); sp.rotation.z = 2.4; fem.add(sp); }
     const tar = new THREE.Group(); tar.position.x = c.tibia; tar.rotation.z = c.tar; tib.add(tar);
-    tar.add(mesh(limbX(0.005, 0.009, c.tarsus, 6), M.leg));
+    let tp = tar; // five-jointed tarsus ending in a tiny claw
+    for (let k = 0; k < 5; k++) {
+      const L = c.tarsus / 5, seg = new THREE.Group(); if (k) { seg.position.x = L; seg.rotation.z = -0.06; }
+      seg.add(mesh(limbX(0.005 - k * 0.0006, 0.008 - k * 0.0007, L * 1.05, 6), M.leg)); tp.add(seg); tp = seg;
+    }
+    const claw = mesh(SPINE_GEO, M.chitin); claw.scale.setScalar(0.45); claw.position.x = c.tarsus / 5; claw.rotation.z = -2.2; tp.add(claw);
     // tripod gait: R-front, L-mid, R-hind vs the others
     const group = (s === 1 ? c.a : 1 - c.a);
     legs.push({ yaw, fem, tib, base: c, group, i });
@@ -715,8 +792,8 @@ function animateRoach(t, dt, runRate, mode) {
   }
   for (const A of antennae) A.segs.forEach((seg, i) => {
     const wob = mode === 'idle' ? 0.05 : 0.025;
-    seg.rotation.x = (i ? -0.045 : 0) + Math.sin(t * 3.2 + i * 0.45 + A.s) * wob + (mode === 'run' || mode === 'slide' ? 0.012 : 0);
-    seg.rotation.y = (i ? A.s * 0.025 : 0) + Math.cos(t * 2.6 + i * 0.35) * wob * 0.8;
+    seg.rotation.x = (i ? -0.028 : 0) + Math.sin(t * 3.2 + i * 0.3 + A.s) * wob * 0.6 + (mode === 'run' || mode === 'slide' ? 0.008 : 0);
+    seg.rotation.y = (i ? A.s * 0.016 : 0) + Math.cos(t * 2.6 + i * 0.25) * wob * 0.5;
   });
   const flying = mode === 'fly';
   for (const W of wings) {
@@ -733,12 +810,32 @@ function animateRoach(t, dt, runRate, mode) {
 }
 
 // ───────────────────────────── tunnel chunks ─────────────────────────────
+// flat-bottom rail cross-section (head, web, foot), extruded along the track
+function railProfileGeometry(len) {
+  const s = new THREE.Shape(), k = 1.05;
+  const P = [[-0.075, 0], [0.075, 0], [0.075, 0.012], [0.02, 0.028], [0.009, 0.04], [0.009, 0.12], [0.034, 0.13], [0.036, 0.168], [0.03, 0.175],
+             [-0.03, 0.175], [-0.036, 0.168], [-0.034, 0.13], [-0.009, 0.12], [-0.009, 0.04], [-0.02, 0.028], [-0.075, 0.012]];
+  P.forEach(([x, y], i) => i ? s.lineTo(x * k, y * k) : s.moveTo(x * k, y * k));
+  const g = new THREE.ExtrudeGeometry(s, { depth: len, bevelEnabled: false, steps: 1 });
+  g.translate(0, 0, -len / 2);
+  // UVs along the rail so the rust texture runs lengthwise
+  const pos = g.attributes.position, uv = g.attributes.uv;
+  for (let i = 0; i < pos.count; i++) uv.setXY(i, (pos.getX(i) + pos.getY(i)) * 4, pos.getZ(i) / len);
+  return g;
+}
 const TUNNEL_W = 6.4, WALL_H = 2.9;
 const G = {
   ballast: new THREE.PlaneGeometry(TUNNEL_W * 2, CH_L).rotateX(-Math.PI / 2),
-  sleeper: new THREE.BoxGeometry(2.5, 0.12, 0.26),
-  railBase: new THREE.BoxGeometry(0.12, 0.15, CH_L),
-  railTop: new THREE.BoxGeometry(0.1, 0.035, CH_L),
+  sleeper: new RoundedBoxGeometry(2.5, 0.14, 0.26, 2, 0.025),
+  railBase: railProfileGeometry(CH_L),
+  railTop: new THREE.BoxGeometry(0.058, 0.006, CH_L),
+  plate: new THREE.BoxGeometry(0.2, 0.025, 0.3),
+  clip: new THREE.TorusGeometry(0.035, 0.012, 6, 10, Math.PI),
+  stone: (() => { // a chunky, faceted piece of crushed granite
+    const g = new THREE.IcosahedronGeometry(0.06, 0); const p = g.attributes.position, v = new THREE.Vector3();
+    for (let i = 0; i < p.count; i++) { v.fromBufferAttribute(p, i); const k = 0.8 + 0.4 * Math.abs(Math.sin(v.x * 91 + v.y * 37 + v.z * 53)); p.setXYZ(i, v.x * k * 1.2, v.y * k * 0.75, v.z * k); }
+    g.computeVertexNormals(); return g; })(),
+  beam: new THREE.ConeGeometry(1.5, 3.2, 24, 1, true).translate(0, -1.6, 0),
   wall: new THREE.PlaneGeometry(CH_L, WALL_H - 0.35),
   kick: new THREE.PlaneGeometry(CH_L, 0.35),
   arch: (() => { const g = new THREE.CylinderGeometry(TUNNEL_W, TUNNEL_W, CH_L, 40, 1, true, Math.PI / 2, Math.PI); g.rotateX(Math.PI / 2); return g; })(),
@@ -753,6 +850,11 @@ const G = {
   poster: new THREE.PlaneGeometry(1.0, 1.4),
 };
 const SLEEPER_STEP = 0.85, SLEEPERS_PER_LANE = Math.floor(CH_L / SLEEPER_STEP);
+const STONES_PER_CHUNK = isTouch ? 380 : 900;
+// lamp light shaft: soft cone, brighter near the lamp, made visible by the tunnel dust
+const beamMat = new THREE.MeshBasicMaterial({
+  map: tex(makeCanvas(8, 128, (g, w, h) => { const gr = g.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, 'rgba(255,190,110,0.9)'); gr.addColorStop(1, 'rgba(255,190,110,0)'); g.fillStyle = gr; g.fillRect(0, 0, w, h); })),
+  transparent: true, opacity: 0.11, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: true });
 const chunks = []; let chunkCount = 0;
 function buildChunk() {
   const c = new THREE.Group();
@@ -762,14 +864,36 @@ function buildChunk() {
   let k = 0;
   for (const lx of LANES) for (let i = 0; i < SLEEPERS_PER_LANE; i++) {
     e.set(0, rand(-0.04, 0.04), 0); q.setFromEuler(e);
-    m4.compose(new THREE.Vector3(lx + rand(-0.04, 0.04), 0.06, -CH_L / 2 + i * SLEEPER_STEP + 0.4), q, new THREE.Vector3(1, 1, 1));
+    m4.compose(new THREE.Vector3(lx + rand(-0.04, 0.04), 0.05, -CH_L / 2 + i * SLEEPER_STEP + 0.4), q, new THREE.Vector3(1, 1, 1));
     sl.setMatrixAt(k, m4); col.setScalar(rand(0.65, 1.1)); sl.setColorAt(k, col); k++;
   }
   c.add(sl);
-  for (const lx of LANES) for (const s of [-1, 1]) {
-    const rb = mesh(G.railBase, M.railBase); rb.position.set(lx + s * 0.72, 0.12 + 0.075, 0); rb.castShadow = true; rb.receiveShadow = true; c.add(rb);
-    const rt = mesh(G.railTop, M.railTop); rt.position.set(lx + s * 0.72, 0.12 + 0.15 + 0.017, 0); c.add(rt);
+  // base plates and spring clips where each rail crosses a sleeper
+  const plates = new THREE.InstancedMesh(G.plate, M.darkMetal, SLEEPERS_PER_LANE * 6);
+  const clips = new THREE.InstancedMesh(G.clip, M.darkMetal, SLEEPERS_PER_LANE * 12);
+  let kp = 0, kc = 0; const one = new THREE.Vector3(1, 1, 1);
+  for (const lx of LANES) for (let i = 0; i < SLEEPERS_PER_LANE; i++) for (const sd of [-1, 1]) {
+    const z = -CH_L / 2 + i * SLEEPER_STEP + 0.4, x = lx + sd * 0.72;
+    q.identity(); m4.compose(new THREE.Vector3(x, 0.128, z), q, one); plates.setMatrixAt(kp++, m4);
+    for (const cs of [-1, 1]) { e.set(0, cs > 0 ? 0 : Math.PI, Math.PI / 2); q.setFromEuler(e); m4.compose(new THREE.Vector3(x + cs * 0.06, 0.15, z), q, one); clips.setMatrixAt(kc++, m4); }
   }
+  plates.receiveShadow = true; clips.castShadow = true; c.add(plates, clips);
+  for (const lx of LANES) for (const s of [-1, 1]) {
+    const rb = mesh(G.railBase, M.railBase); rb.position.set(lx + s * 0.72, 0.14, 0); rb.castShadow = true; rb.receiveShadow = true; c.add(rb);
+    const rt = mesh(G.railTop, M.railTop); rt.position.set(lx + s * 0.72, 0.14 + 0.184, 0); c.add(rt);
+  }
+  // loose ballast stones heaped between and around the sleepers
+  const stones = new THREE.InstancedMesh(G.stone, M.stone, STONES_PER_CHUNK);
+  for (let i = 0; i < STONES_PER_CHUNK; i++) {
+    const lane = LANES[i % 3], r = Math.random();
+    const x = r < 0.7 ? lane + rand(-1.35, 1.35) : pick([-1.3, 1.3, -3.95, 3.95]) + rand(-0.35, 0.35);
+    const z = rand(-CH_L / 2, CH_L / 2);
+    e.set(rand(0, 6.28), rand(0, 6.28), rand(0, 6.28)); q.setFromEuler(e);
+    const sc = rand(0.4, 1.1);
+    m4.compose(new THREE.Vector3(x, rand(0.01, 0.07), z), q, new THREE.Vector3(sc, sc, sc));
+    stones.setMatrixAt(i, m4); { const v = rand(0.55, 1.25), w = Math.random() < 0.12; col.setRGB(v * (w ? 1.1 : 1), v * (w ? 0.9 : 0.99), v * (w ? 0.75 : 0.97)); } stones.setColorAt(i, col);
+  }
+  stones.receiveShadow = true; stones.castShadow = !isTouch; c.add(stones);
   for (const s of [-1, 1]) {
     const w = mesh(G.wall, M.tiles); w.position.set(s * TUNNEL_W, 0.35 + (WALL_H - 0.35) / 2, 0); w.rotation.y = -s * Math.PI / 2; w.receiveShadow = true; c.add(w);
     const kk = mesh(G.kick, M.kick); kk.position.set(s * TUNNEL_W, 0.175, 0); kk.rotation.y = -s * Math.PI / 2; c.add(kk);
@@ -787,6 +911,7 @@ function buildChunk() {
   const lamp = new THREE.Group();
   const lh = mesh(G.lampHousing, M.lampHousing); lamp.add(lh);
   const lg = mesh(G.lampGlass, M.lampGlass); lg.rotation.y = Math.PI / 2; lg.position.x = 0.1; lamp.add(lg);
+  const beam = mesh(G.beam, beamMat); beam.position.set(0.3, 0, 0); beam.rotation.z = 0.55; beam.renderOrder = 2; lamp.add(beam);
   // phones get a real light in every other chunk only (fewer lights = much cheaper shaders)
   let light = null;
   if (!isTouch || chunkCount % 2 === 0) { light = new THREE.PointLight(0xffb866, isTouch ? 46 : 34, 26, 1.7); light.position.x = 0.8; lamp.add(light); }
@@ -795,7 +920,7 @@ function buildChunk() {
   const puddle = mesh(G.puddle, M.puddle); puddle.position.y = 0.015; c.add(puddle);
   const poster = mesh(G.poster, new THREE.MeshStandardMaterial({ roughness: 0.6 })); poster.receiveShadow = true; c.add(poster);
   scene.add(c);
-  const ch = { g: c, lamp, light, glass: lg, puddle, poster, flicker: false };
+  const ch = { g: c, lamp, light, glass: lg, beam, puddle, poster, flicker: false };
   dressChunk(ch);
   return ch;
 }
@@ -822,7 +947,7 @@ const dustGeo = new THREE.BufferGeometry();
 const dustPos = new Float32Array(DUST_N * 3);
 for (let i = 0; i < DUST_N; i++) { dustPos[i * 3] = rand(-6, 6); dustPos[i * 3 + 1] = rand(0.2, 7); dustPos[i * 3 + 2] = rand(-70, 8); }
 dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3));
-const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({ size: 0.05, map: tex(dotC), transparent: true, opacity: 0.45, depthWrite: false, blending: THREE.AdditiveBlending, color: 0xffd9a8 }));
+const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({ size: 0.05, map: tex(dotC), transparent: true, opacity: 0.22, depthWrite: false, blending: THREE.AdditiveBlending, color: 0xffd9a8 }));
 scene.add(dust);
 
 // ───────────────────────────── obstacles ─────────────────────────────
@@ -838,6 +963,7 @@ const TG = {
   window: new THREE.PlaneGeometry(1.2, 0.85),
   bumper: new THREE.BoxGeometry(2.2, 0.25, 0.3),
 };
+const flareMat = new THREE.SpriteMaterial({ map: tex(glowC), color: 0xfff0d0, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.85, fog: false });
 function buildTrain(len) {
   const g = new THREE.Group();
   const bodyMat = pick(M.trainBody);
@@ -856,7 +982,10 @@ function buildTrain(len) {
   const face = mesh(TG.face, M.trainEnd); face.position.set(0, 1.95, fz - 0.06); g.add(face);
   const gl = mesh(TG.glass, M.glass); gl.position.set(0, 2.55, fz + 0.01); g.add(gl);
   const sign = mesh(TG.sign, M.destSign); sign.position.set(0, 3.25, fz + 0.01); g.add(sign);
-  for (const s of [-1, 1]) { const l = mesh(TG.lamp, M.headlight); l.position.set(s * 0.85, 1.05, fz + 0.012); g.add(l); }
+  for (const s of [-1, 1]) {
+    const l = mesh(TG.lamp, M.headlight); l.position.set(s * 0.85, 1.05, fz + 0.012); g.add(l);
+    const flare = new THREE.Sprite(flareMat); flare.scale.set(2.6, 2.6, 1); flare.position.set(s * 0.85, 1.05, fz + 0.15); g.add(flare);
+  }
   const bump = mesh(TG.bumper, M.darkMetal); bump.position.set(0, 0.6, fz + 0.12); g.add(bump);
   shadowAll(g, true, true);
   return g;
@@ -1213,9 +1342,10 @@ function updateWorld(dt, move) {
   for (const ch of chunks) {
     ch.g.position.z += move;
     if (ch.g.position.z - CH_L / 2 > 10) { ch.g.position.z -= CH_N * CH_L; dressChunk(ch); }
+    if (!ch.flicker) ch.beam.visible = true;
     if (ch.flicker) {
       const on = Math.sin(S.t * 31 + ch.g.position.z) > -0.6 || Math.random() < 0.3;
-      if (ch.light) ch.light.intensity = on ? 34 : 4; ch.glass.material = on ? M.lampGlass : M.lampHousing;
+      if (ch.light) ch.light.intensity = on ? 34 : 4; ch.glass.material = on ? M.lampGlass : M.lampHousing; ch.beam.visible = on;
     }
   }
   const p = dust.geometry.attributes.position;
@@ -1386,6 +1516,7 @@ let last = performance.now(), frameAcc = 0, frames = 0;
 // step down quality on slow phones: resolution first, then bloom, then shadows
 function degradeQuality() {
   if (dpr > 0.75) { dpr = Math.max(0.75, dpr - 0.2); renderer.setPixelRatio(dpr); composer.setPixelRatio(dpr); }
+  else if (gtao && gtao.enabled) gtao.enabled = false;
   else if (bloom.enabled) bloom.enabled = false;
   else if (renderer.shadowMap.enabled) { renderer.shadowMap.enabled = false; scene.traverse(o => { if (o.material) [].concat(o.material).forEach(m => m.needsUpdate = true); }); }
 }
@@ -1398,6 +1529,7 @@ function loop(now) {
   if (S.state === 'play') animateRoach(S.t, dt, S.speed * 1.6, mode);
   placeRoach(dt);
   updateCamera(dt);
+  lens.uniforms.uTime.value = now / 1000;
   composer.render();
   // adaptive resolution
   frameAcc += dt; frames++;
@@ -1421,6 +1553,7 @@ canvas.addEventListener('webglcontextrestored', () => location.reload());
 const onResize = () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight); bloom.setSize(innerWidth, innerHeight);
+  if (gtao) gtao.setSize(innerWidth, innerHeight);
 };
 addEventListener('resize', onResize);
 addEventListener('orientationchange', () => setTimeout(onResize, 250));

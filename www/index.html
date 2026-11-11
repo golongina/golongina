@@ -164,14 +164,12 @@ kbd { font: 700 12px/1 var(--body); background: var(--tile); color: var(--ink); 
 
 <script type="module">
 import * as THREE from './vendor/three/three.module.js';
-import { RoomEnvironment } from './vendor/three/addons/environments/RoomEnvironment.js';
 import { EffectComposer } from './vendor/three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from './vendor/three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from './vendor/three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from './vendor/three/addons/postprocessing/OutputPass.js';
 import { ShaderPass } from './vendor/three/addons/postprocessing/ShaderPass.js';
 import { GTAOPass } from './vendor/three/addons/postprocessing/GTAOPass.js';
-import { RGBELoader } from './vendor/three/addons/loaders/RGBELoader.js';
 import { RoundedBoxGeometry } from './vendor/three/addons/geometries/RoundedBoxGeometry.js';
 
 // ───────────────────────────── constants ─────────────────────────────
@@ -201,7 +199,7 @@ let dpr = Math.min(window.devicePixelRatio || 1, isTouch ? 1.35 : 1.75);
 renderer.setPixelRatio(dpr);
 renderer.setSize(innerWidth, innerHeight);
 renderer.toneMapping = THREE.AgXToneMapping;   // filmic response close to a camera sensor
-renderer.toneMappingExposure = 1.2;
+renderer.toneMappingExposure = isTouch ? 1.18 : 1.05; // phones are often viewed in brighter rooms
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = isTouch ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
 const MAX_ANISO = renderer.capabilities.getMaxAnisotropy();
@@ -212,16 +210,31 @@ scene.background = FOG_COLOR;
 scene.fog = new THREE.FogExp2(FOG_COLOR, 0.0165);
 
 const pmrem = new THREE.PMREMGenerator(renderer);
-scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
-// real captured light (CC0 HDRI of a concrete underpass) for reflections once it has loaded
-new RGBELoader().load('env/pedestrian_overpass_1k.hdr', hdr => {
-  scene.environment = pmrem.fromEquirectangular(hdr).texture; hdr.dispose();
-}, undefined, () => {});
+// reflection environment that matches the tunnel itself: dark sooty concrete, warm wall lamps, cool ceiling tubes.
+// (an outdoor HDRI put blue sky into every glossy surface, which is wrong underground)
+function tunnelEnvironment() {
+  const env = new THREE.Scene();
+  const shell = new THREE.Mesh(new THREE.CylinderGeometry(6, 6, 60, 24, 1, true).rotateX(Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0x1d1813, side: THREE.BackSide }));
+  env.add(shell);
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(12, 60).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0x0f0c0a }));
+  floor.position.y = -3; env.add(floor);
+  const warm = new THREE.MeshBasicMaterial({ color: new THREE.Color(0xffb15a).multiplyScalar(5) });
+  const cool = new THREE.MeshBasicMaterial({ color: new THREE.Color(0xdfe8ff).multiplyScalar(3) });
+  for (let z = -27; z <= 27; z += 9) {
+    for (const s of [-1, 1]) { const l = new THREE.Mesh(new THREE.SphereGeometry(0.35, 12, 8), warm); l.position.set(s * 5.6, -0.6, z); env.add(l); }
+    const t = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.1, 2.4), cool); t.position.set(0, 5.8, z + 4.5); env.add(t);
+  }
+  return pmrem.fromScene(env, 0.02).texture;
+}
+scene.environment = tunnelEnvironment();
 
-const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.05, 260);
+const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.15, 220); // near plane kept off zero for depth precision
 camera.position.set(2.4, 1.3, 2.6);
 
-const composer = new EffectComposer(renderer);
+// multisampled HDR buffer: without it every rail and sleeper edge crawls and shimmers once post-processing is on
+const msaaTarget = new THREE.WebGLRenderTarget(innerWidth * dpr, innerHeight * dpr, { type: THREE.HalfFloatType, samples: renderer.capabilities.isWebGL2 && (renderer.extensions.has('EXT_color_buffer_float') || renderer.extensions.has('EXT_color_buffer_half_float')) ? 4 : 0 });
+const composer = new EffectComposer(renderer, msaaTarget);
 composer.setPixelRatio(dpr);
 composer.setSize(innerWidth, innerHeight);
 composer.addPass(new RenderPass(scene, camera));
@@ -231,15 +244,15 @@ if (!isTouch) {
   gtao = new GTAOPass(scene, camera, innerWidth, innerHeight);
   gtao.updateGtaoMaterial({ radius: 0.5, distanceExponent: 1.5, thickness: 1.5, scale: 1.2, samples: 12 });
   gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 6, rings: 2, samples: 12 });
-  gtao.blendIntensity = 0.85;
+  gtao.blendIntensity = 0.7;
   composer.addPass(gtao);
 }
-const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.42, 0.6, 0.92);
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.18, 0.35, 1.0);
 composer.addPass(bloom);
 composer.addPass(new OutputPass());
 // camera look: lens vignette, slight chromatic aberration at the edges, sensor grain, gentle contrast curve
 const lens = new ShaderPass({
-  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uGrain: { value: isTouch ? 0.035 : 0.045 } },
+  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uGrain: { value: isTouch ? 0.012 : 0.018 } },
   vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
   fragmentShader: `
     uniform sampler2D tDiffuse; uniform float uTime; uniform float uGrain; varying vec2 vUv;
@@ -259,14 +272,17 @@ const lens = new ShaderPass({
 composer.addPass(lens);
 
 // ───────────────────────────── lights ─────────────────────────────
-scene.add(new THREE.HemisphereLight(0xb7c4d6, 0x2a1e14, 0.55));
-const sun = new THREE.DirectionalLight(0xffe2b8, 1.25);
+scene.add(new THREE.HemisphereLight(0xb7c4d6, 0x2a1e14, 0.5));
+const sun = new THREE.DirectionalLight(0xffe2b8, 0.85);
 sun.castShadow = true;
 sun.shadow.mapSize.set(isTouch ? 1024 : 2048, isTouch ? 1024 : 2048);
 Object.assign(sun.shadow.camera, { left: -12, right: 12, top: 16, bottom: -16, near: 1, far: 40 });
 sun.shadow.bias = -0.0004;
 sun.shadow.normalBias = 0.03;
 scene.add(sun, sun.target);
+// soft warm fill that travels with the roach so the hero stays readable on small screens (no shadows, cheap)
+const fill = new THREE.PointLight(0xffc690, 2.2, 7, 1.6);
+scene.add(fill);
 
 // ───────────────────────────── procedural textures ─────────────────────────────
 function makeCanvas(w, h, draw) {
@@ -596,12 +612,12 @@ const M = {
   stone: new THREE.MeshStandardMaterial({ ...pbr('concrete', 1, 1, { albedo: false, normalScale: 2 }), color: 0x4a4643, envMapIntensity: 0.3 }),
   wood: new THREE.MeshStandardMaterial({ ...pbr('wood', 1, 1, { normalScale: 1.5 }), envMapIntensity: 0.2 }),
   railBase: new THREE.MeshStandardMaterial({ ...pbr('rust', 1, 30, { metal: true }), envMapIntensity: 0.6 }),
-  railTop: new THREE.MeshStandardMaterial({ color: 0xb4b0aa, metalness: 1, roughness: 0.22, envMapIntensity: 0.8 }),
+  railTop: new THREE.MeshStandardMaterial({ color: 0x9a968f, metalness: 1, roughness: 0.38, envMapIntensity: 0.5 }),
   rust: new THREE.MeshStandardMaterial({ ...pbr('rust', 2, 6, { metal: true }), envMapIntensity: 0.6 }),
   cable: new THREE.MeshStandardMaterial({ color: 0x141414, roughness: 0.5, envMapIntensity: 0.6 }),
   lampHousing: new THREE.MeshStandardMaterial({ color: 0x2c2a26, metalness: 0.7, roughness: 0.5 }),
-  lampGlass: new THREE.MeshStandardMaterial({ color: 0xffc77a, emissive: 0xffb45c, emissiveIntensity: 5 }),
-  tube: new THREE.MeshStandardMaterial({ color: 0xe8f0ff, emissive: 0xdfe8ff, emissiveIntensity: 3.2 }),
+  lampGlass: new THREE.MeshStandardMaterial({ color: 0xffc77a, emissive: 0xffb45c, emissiveIntensity: 1.6 }),
+  tube: new THREE.MeshStandardMaterial({ color: 0xe8f0ff, emissive: 0xdfe8ff, emissiveIntensity: 1.3 }),
   puddle: new THREE.MeshPhysicalMaterial({ color: 0x0b0a08, roughness: 0.04, metalness: 0.1, clearcoat: 1, transparent: true, opacity: 0.85, envMapIntensity: 1.2 }),
   trainBody: trainSideTexs.map(t => new THREE.MeshStandardMaterial({ ...pbr('trainmetal', 1, 1, { albedo: false, metal: true }), map: t, envMapIntensity: 1.0 })),
   trainEnd: new THREE.MeshStandardMaterial({ color: 0xb3b6ba, metalness: 0.7, roughness: 0.35, envMapIntensity: 1 }),
@@ -615,8 +631,8 @@ const M = {
       g.fillStyle = '#d8d8d0'; for (let x = 40; x < w; x += 124) g.fillRect(x, 16, 4, h);  // grab poles
       g.fillStyle = 'rgba(30,30,30,0.55)'; for (let x = 70; x < w; x += 120) g.fillRect(x, h * 0.3, 18, h * 0.5);  // a few standing figures
       g.fillStyle = 'rgba(255,255,255,0.12)'; g.beginPath(); g.moveTo(0, h); g.lineTo(80, 0); g.lineTo(130, 0); g.lineTo(50, h); g.fill(); // glass reflection
-    })); return new THREE.MeshStandardMaterial({ map: t, emissiveMap: t, emissive: 0xffffff, emissiveIntensity: 1.25, roughness: 0.05, metalness: 0.1 }); })(),
-  headlight: new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xfff2cc, emissiveIntensity: 14 }),
+    })); return new THREE.MeshStandardMaterial({ map: t, emissiveMap: t, emissive: 0xffffff, emissiveIntensity: 0.7, roughness: 0.05, metalness: 0.1 }); })(),
+  headlight: new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xfff2cc, emissiveIntensity: 4 }),
   destSign: null,
   stripe: new THREE.MeshStandardMaterial({ map: tex(stripeC), roughness: 0.4, envMapIntensity: 0.7 }),
   hazard: new THREE.MeshStandardMaterial({ map: tex(hazardC, 2, 1), roughness: 0.6 }),
@@ -828,7 +844,7 @@ const G = {
   ballast: new THREE.PlaneGeometry(TUNNEL_W * 2, CH_L).rotateX(-Math.PI / 2),
   sleeper: new RoundedBoxGeometry(2.5, 0.14, 0.26, 2, 0.025),
   railBase: railProfileGeometry(CH_L),
-  railTop: new THREE.BoxGeometry(0.058, 0.006, CH_L),
+  railTop: new THREE.BoxGeometry(0.058, 0.014, CH_L),
   plate: new THREE.BoxGeometry(0.2, 0.025, 0.3),
   clip: new THREE.TorusGeometry(0.035, 0.012, 6, 10, Math.PI),
   stone: (() => { // a chunky, faceted piece of crushed granite
@@ -854,7 +870,7 @@ const STONES_PER_CHUNK = isTouch ? 380 : 900;
 // lamp light shaft: soft cone, brighter near the lamp, made visible by the tunnel dust
 const beamMat = new THREE.MeshBasicMaterial({
   map: tex(makeCanvas(8, 128, (g, w, h) => { const gr = g.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, 'rgba(255,190,110,0.9)'); gr.addColorStop(1, 'rgba(255,190,110,0)'); g.fillStyle = gr; g.fillRect(0, 0, w, h); })),
-  transparent: true, opacity: 0.11, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: true });
+  transparent: true, opacity: 0.045, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: true });
 const chunks = []; let chunkCount = 0;
 function buildChunk() {
   const c = new THREE.Group();
@@ -880,7 +896,7 @@ function buildChunk() {
   plates.receiveShadow = true; clips.castShadow = true; c.add(plates, clips);
   for (const lx of LANES) for (const s of [-1, 1]) {
     const rb = mesh(G.railBase, M.railBase); rb.position.set(lx + s * 0.72, 0.14, 0); rb.castShadow = true; rb.receiveShadow = true; c.add(rb);
-    const rt = mesh(G.railTop, M.railTop); rt.position.set(lx + s * 0.72, 0.14 + 0.184, 0); c.add(rt);
+    const rt = mesh(G.railTop, M.railTop); rt.position.set(lx + s * 0.72, 0.14 + 0.1838 + 0.003, 0); // polished running band sits proud of the head, no coplanar faces c.add(rt);
   }
   // loose ballast stones heaped between and around the sleepers
   const stones = new THREE.InstancedMesh(G.stone, M.stone, STONES_PER_CHUNK);
@@ -914,7 +930,7 @@ function buildChunk() {
   const beam = mesh(G.beam, beamMat); beam.position.set(0.3, 0, 0); beam.rotation.z = 0.55; beam.renderOrder = 2; lamp.add(beam);
   // phones get a real light in every other chunk only (fewer lights = much cheaper shaders)
   let light = null;
-  if (!isTouch || chunkCount % 2 === 0) { light = new THREE.PointLight(0xffb866, isTouch ? 46 : 34, 26, 1.7); light.position.x = 0.8; lamp.add(light); }
+  if (!isTouch || chunkCount % 2 === 0) { light = new THREE.PointLight(0xffb866, isTouch ? 26 : 18, 24, 1.8); light.position.x = 0.8; lamp.add(light); }
   chunkCount++;
   c.add(lamp);
   const puddle = mesh(G.puddle, M.puddle); puddle.position.y = 0.015; c.add(puddle);
@@ -928,7 +944,7 @@ function dressChunk(ch) {
   const side = Math.random() < 0.5 ? -1 : 1;
   ch.lamp.position.set(side * (TUNNEL_W - 0.12), 2.3, rand(-8, 8));
   ch.lamp.rotation.y = side > 0 ? Math.PI : 0;
-  ch.flicker = Math.random() < 0.18;
+  ch.flicker = false; // steady lamps (flicker read as rendering glitches)
   const lane = pick([-1.3, 1.3, -3.9, 3.9, -2.6, 0, 2.6]);
   ch.puddle.position.set(lane + rand(-0.3, 0.3), 0.015, rand(-9, 9));
   ch.puddle.scale.set(rand(0.4, 1.0), 1, rand(0.6, 1.6));
@@ -936,18 +952,18 @@ function dressChunk(ch) {
   ch.poster.visible = Math.random() < 0.55;
   if (ch.poster.visible) {
     const ps = -side; ch.poster.material.map = pick(posterTexs); ch.poster.material.needsUpdate = true;
-    ch.poster.position.set(ps * (TUNNEL_W - 0.02), 1.55, rand(-9, 9)); ch.poster.rotation.y = -ps * Math.PI / 2;
+    ch.poster.position.set(ps * (TUNNEL_W - 0.05), 1.55, rand(-9, 9)); ch.poster.rotation.y = -ps * Math.PI / 2;
   }
 }
 for (let i = 0; i < CH_N; i++) { const ch = buildChunk(); ch.g.position.z = CH_L - i * CH_L - CH_L / 2 + 6; chunks.push(ch); }
 
 // dust motes drifting in lamp light
-const DUST_N = 380;
+const DUST_N = 160;
 const dustGeo = new THREE.BufferGeometry();
 const dustPos = new Float32Array(DUST_N * 3);
 for (let i = 0; i < DUST_N; i++) { dustPos[i * 3] = rand(-6, 6); dustPos[i * 3 + 1] = rand(0.2, 7); dustPos[i * 3 + 2] = rand(-70, 8); }
 dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3));
-const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({ size: 0.05, map: tex(dotC), transparent: true, opacity: 0.22, depthWrite: false, blending: THREE.AdditiveBlending, color: 0xffd9a8 }));
+const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({ size: 0.07, map: tex(dotC), transparent: true, opacity: 0.12, depthWrite: false, blending: THREE.AdditiveBlending, color: 0xffd9a8 }));
 scene.add(dust);
 
 // ───────────────────────────── obstacles ─────────────────────────────
@@ -963,7 +979,7 @@ const TG = {
   window: new THREE.PlaneGeometry(1.2, 0.85),
   bumper: new THREE.BoxGeometry(2.2, 0.25, 0.3),
 };
-const flareMat = new THREE.SpriteMaterial({ map: tex(glowC), color: 0xfff0d0, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.85, fog: false });
+const flareMat = new THREE.SpriteMaterial({ map: tex(glowC), color: 0xfff0d0, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.3, fog: true });
 function buildTrain(len) {
   const g = new THREE.Group();
   const bodyMat = pick(M.trainBody);
@@ -984,7 +1000,7 @@ function buildTrain(len) {
   const sign = mesh(TG.sign, M.destSign); sign.position.set(0, 3.25, fz + 0.01); g.add(sign);
   for (const s of [-1, 1]) {
     const l = mesh(TG.lamp, M.headlight); l.position.set(s * 0.85, 1.05, fz + 0.012); g.add(l);
-    const flare = new THREE.Sprite(flareMat); flare.scale.set(2.6, 2.6, 1); flare.position.set(s * 0.85, 1.05, fz + 0.15); g.add(flare);
+    const flare = new THREE.Sprite(flareMat); flare.scale.set(1.4, 1.4, 1); flare.position.set(s * 0.85, 1.05, fz + 0.15); g.add(flare);
   }
   const bump = mesh(TG.bumper, M.darkMetal); bump.position.set(0, 0.6, fz + 0.12); g.add(bump);
   shadowAll(g, true, true);
@@ -1506,7 +1522,8 @@ function updateCamera(dt) {
   if (Math.abs(viewOff.x) > 0.5 || Math.abs(viewOff.y) > 0.5) camera.setViewOffset(innerWidth, innerHeight, viewOff.x, viewOff.y, innerWidth, innerHeight);
   else if (camera.view && camera.view.enabled) camera.clearViewOffset();
   // shadow light follows
-  sun.position.set(P.x + 3, 13, -3); sun.target.position.set(P.x, 0, -7);
+  sun.position.set(3, 13, -3); sun.target.position.set(0, 0, -7);
+  fill.position.set(P.x + 0.6, P.y + 1.8, 1.6);
   // fov kick with speed
   const fov = (S.state === 'play' ? 62 + (S.speed - MIN_SPEED) * 0.35 : 55) + portraitness() * 12;
   if (Math.abs(camera.fov - fov) > 0.05) { camera.fov = THREE.MathUtils.damp(camera.fov, fov, 3, dt); camera.updateProjectionMatrix(); }

@@ -32,9 +32,10 @@ resources/           Uygulama simgesi ve açılış ekranı kaynakları
 ## Görüntü
 
 - Fiziksel tabanlı (PBR) malzemeler: her yüzeyde renk, normal, pürüzlülük ve ortam gölgesi haritaları (`www/textures/`, `tools/gen_textures.py` ile üretilir).
-- Gerçek bir beton alt geçitte çekilmiş HDRI ışık ortamı (Poly Haven, CC0) yansımalar için.
+- Yansımalar tünelin kendi ışık ortamından (karanlık beton, sıcak duvar lambaları, soğuk tavan lambaları) hesaplanır.
 - Gerçek ray kesiti, bağlantı plakaları ve klipsler, 3D balast taşları, lamba ışık hüzmeleri, tozlu hava.
-- Kamera benzeri son işlem: AgX ton eşleme, ışık taşması, kenarlarda renk sapması, vinyet ve sensör grenini. Masaüstünde ek olarak GTAO ortam gölgelemesi.
+- Kenar yumuşatma (4x MSAA) son işlem zincirinin içinde de açık; titreme yapan hareketli gölge kamerası ve yanıp sönen lambalar yok.
+- Kamera benzeri son işlem: AgX ton eşleme, hafif ışık taşması, kenarlarda renk sapması, vinyet ve sensör grenini. Masaüstünde ek olarak GTAO ortam gölgelemesi.
 - Hamam böceği: dökülmüş kanat kabukları, damar dokusu, dikenli bacaklar, beş eklemli ayaklar, 30 boğumlu antenler.
 
 Oyun dikey ekran için ayarlıdır. Telefonda kamera üç şeridi de gösterecek şekilde geri çekilir, yavaş cihazlarda çözünürlük, ışık parlaması ve gölgeler otomatik olarak kısılır.

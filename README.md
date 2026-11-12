@@ -3,6 +3,7 @@
 Ana karakteri bir hamam böceği olan, Subway Surfers tarzı 3D sonsuz koşu oyunu. **iOS, Android** ve web tarayıcısında çalışır.
 
 - Metro tünelinde üç şeritte koş, ekmek kırıntılarını topla.
+- Bazı duran trenlerin önünde rampa var: rampadan tırman, vagonların çatısında koş, çatıdan çatıya şerit değiştir. Vagon bitince yere atlarsın.
 - Trenlerden kaç, bariyerlerin ve böcek ilacı kutularının üstünden zıpla, tel çitlerin altından yassılarak geç.
 - Kanat güçlendiricisi seni 7 saniye uçurur.
 - Bir kez tökezlersen terlik peşine düşer; ikinci tökezlemede ezilirsin.

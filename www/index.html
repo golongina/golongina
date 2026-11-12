@@ -113,7 +113,7 @@ kbd { font: 700 12px/1 var(--body); background: var(--tile); color: var(--ink); 
     <div class="band"><span>HAT B · TÜNEL 4</span><span>YÖN: KIRINTILAR →</span></div>
     <div class="inner">
       <h1>Metro <span>Böceği</span></h1>
-      <p>Mutfaktan son anda kaçtın, şimdi metro tünelindesin. Raylar boyunca koş, ekmek kırıntılarını topla, trenlerden ve böcek ilacından uzak dur. İki kez tökezlersen terlik seni yakalar.</p>
+      <p>Mutfaktan son anda kaçtın, şimdi metro tünelindesin. Raylar boyunca koş, ekmek kırıntılarını topla, rampalardan trenlerin üstüne tırman, böcek ilacından uzak dur. İki kez tökezlersen terlik seni yakalar.</p>
       <div class="keys">
         <div class="k-desk"><kbd>←</kbd><kbd>→</kbd> şerit değiştir</div>
         <div class="k-desk"><kbd>↑</kbd><kbd>Boşluk</kbd> zıpla</div>
@@ -180,6 +180,8 @@ const SPAWN_Z = -140;
 const GROUND_Y = 0.12;
 const GRAV = 40, JUMP_V = 13.2;
 const FLY_Y = 4.7, FLY_TIME = 7;
+const ROOF_Y = 3.72;                      // walkable top of a metro car
+const RAMP_L = 9, RAMP_SLOPE_L = 7.4;     // service ramp: 7.4 m incline, then a flat landing that meets the roof
 const MIN_SPEED = 15, MAX_SPEED = 34;
 const isTouch = matchMedia('(pointer: coarse)').matches;
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -1078,13 +1080,61 @@ function buildFence() {
   shadowAll(g); return mergeStatic(g);
 }
 
+// steel service ramp with diamond-plate deck, leading up onto a parked car's roof
+const diamondC = makeCanvas(128, 128, (g, w, h) => {
+  g.fillStyle = '#4a4844'; g.fillRect(0, 0, w, h);
+  for (let y = 0; y < h; y += 16) for (let x = (y / 16) % 2 ? 8 : 0; x < w; x += 16) {
+    g.save(); g.translate(x + 4, y + 4); g.rotate(((x + y) / 16) % 2 ? 0.8 : -0.8);
+    g.fillStyle = '#6e6b66'; g.fillRect(-5, -1.5, 10, 3); g.fillStyle = '#2e2c29'; g.fillRect(-5, 1.5, 10, 1); g.restore();
+  }
+  g.globalCompositeOperation = 'multiply'; paintNoise(g, 128, [255, 240, 225], 0.35, [4, 8, 16, 32], 0.6); g.globalCompositeOperation = 'source-over';
+});
+M.deck = new THREE.MeshStandardMaterial({ map: tex(diamondC, 4, 18), color: 0x6e6a64, bumpMap: tex(diamondC, 4, 18, false), bumpScale: 1.5, metalness: 0.6, roughness: 0.62, envMapIntensity: 0.35 });
+function buildRamp() {
+  const g = new THREE.Group(), H = ROOF_Y - 0.04, SL = RAMP_SLOPE_L, RL = RAMP_L;
+  const ang = Math.atan2(H, SL), len = Math.hypot(H, SL);
+  // local z: ramp foot (height 0) at +RL/2 (toward the runner), flat landing reaches -RL/2 where the car begins
+  const deck = mesh(new THREE.BoxGeometry(2.1, 0.08, len), M.deck); deck.position.set(0, H / 2 - 0.04, RL / 2 - SL / 2); deck.rotation.x = ang; g.add(deck);
+  const top = mesh(new THREE.BoxGeometry(2.1, 0.08, RL - SL), M.deck); top.position.set(0, H - 0.04, -SL / 2); g.add(top);
+  for (const sx of [-1, 1]) {
+    const st = mesh(new THREE.BoxGeometry(0.08, 0.22, len), M.hazard); st.position.set(sx * 1.07, H / 2 + 0.03, RL / 2 - SL / 2); st.rotation.x = ang; g.add(st);
+    const st2 = mesh(new THREE.BoxGeometry(0.08, 0.22, RL - SL), M.hazard); st2.position.set(sx * 1.07, H + 0.03, -SL / 2); g.add(st2);
+    for (let k = 1; k <= 5; k++) { // legs under the incline and landing
+      const zz = RL / 2 - (SL + (RL - SL)) * k / 5.4, hh = Math.min(H, H * (RL / 2 - zz) / SL);
+      const leg = mesh(new THREE.BoxGeometry(0.09, hh, 0.09), M.darkMetal); leg.position.set(sx * 0.95, hh / 2, zz); g.add(leg);
+    }
+  }
+  const lip = mesh(new THREE.BoxGeometry(2.1, 0.03, 0.25), M.hazard); lip.position.set(0, 0.015, RL / 2 - 0.12); g.add(lip);
+  shadowAll(g); return mergeStatic(g);
+}
+// height of a ramp's deck at distance u from its foot
+const rampHeight = u => u <= 0 ? -Infinity : u >= RAMP_SLOPE_L ? ROOF_Y : ROOF_Y * u / RAMP_SLOPE_L;
+
 const OB_TYPES = {
   train:   { build: () => buildTrain(14), box: { hw: 1.2, y0: 0, y1: 3.5, hl: 7.1 } },
   train2:  { build: () => buildTrain(24), box: { hw: 1.2, y0: 0, y1: 3.5, hl: 12.1 } },
   barrier: { build: buildBarrier, box: { hw: 1.12, y0: 0, y1: 0.86, hl: 0.22 } },
   spray:   { build: buildSpray, box: { hw: 0.7, y0: 0, y1: 0.68, hl: 0.34 } },
   fence:   { build: buildFence, box: { hw: 1.2, y0: 0.44, y1: 3.4, hl: 0.1 } },
+  ramp:    { build: buildRamp, box: { hw: 0, y0: 0, y1: -1, hl: RAMP_L / 2 } },   // no collision box: you run up it
 };
+// walkable surface of an obstacle at local z (player z minus obstacle z); -Infinity where there is none
+function surfaceAt(o, lz) {
+  if (o.type === 'train' || o.type === 'train2') return Math.abs(lz) <= o.box.hl - 0.1 ? ROOF_Y : -Infinity;
+  if (o.type === 'ramp') return rampHeight(RAMP_L / 2 - lz);
+  return -Infinity;
+}
+// highest surface under the runner's centre line (player z = 0)
+function groundAt(x) {
+  let h = GROUND_Y;
+  for (const o of obstacles) {
+    if ((o.type !== 'train' && o.type !== 'train2' && o.type !== 'ramp') || Math.abs(x - o.g.position.x) > 1.0) continue;
+    // sample under the head and the tail too, so the runner steps onto the roof before the body meets the car
+    const z = o.g.position.z;
+    h = Math.max(h, surfaceAt(o, -z), surfaceAt(o, -0.7 - z), surfaceAt(o, 0.7 - z));
+  }
+  return h;
+}
 const pools = {}; const obstacles = [];
 function getOb(type) {
   const pool = pools[type] || (pools[type] = []);
@@ -1252,11 +1302,20 @@ function spawnRow() {
       const long = !moving && Math.random() < 0.3;
       const type = long ? 'train2' : 'train', hl = OB_TYPES[type].box.hl;
       const vz = moving ? 9 + diff * 7 : 0;
-      const zc = z - hl;
-      const [a, b] = arrivalTimes(zc, hl, s + vz);
+      const ramp = !moving && Math.random() < 0.5;
+      const rl = ramp ? RAMP_L : 0;
+      const zc = z - hl - rl;
+      // the lane is busy from the ramp foot to the car's tail
+      const [a, b] = arrivalTimes(zc + rl / 2, hl + rl / 2, s + vz);
       if (canTrain(l, a, b)) {
         const o = getOb(type); o.g.position.set(x, 0, zc); o.vz = vz; o.x = x; rowKinds[l] = 'train';
         S.trainIv[l].push([a, b]);
+        if (ramp) {
+          const r = getOb('ramp'); r.g.position.set(x, 0, z - RAMP_L / 2); r.x = x;
+          if (P.fly <= 0.6) for (let d = 1.5; d < RAMP_L + hl * 2 - 0.5; d += 1.7) { // crumbs up the ramp and along the roof
+            const c = getCrumb(); c.g.position.set(x, Math.max(rampHeight(d), d > RAMP_L ? ROOF_Y : 0) + 0.32, z - d);
+          }
+        }
         continue;
       }
     }
@@ -1454,9 +1513,21 @@ function update(dt) {
   if (P.fly > 0) {
     P.fly -= dt; P.y = THREE.MathUtils.damp(P.y, FLY_Y, 4, dt); P.vy = 0; P.air = true;
     if (P.fly <= 0) { P.invuln = 1.6; Sfx.stopBuzz(); }
-  } else if (P.air) {
-    P.vy -= GRAV * dt; P.y += P.vy * dt;
-    if (P.y <= GROUND_Y) { P.y = GROUND_Y; P.vy = 0; P.air = false; P.squash = 0.8; }
+  } else {
+    const gY = groundAt(P.x);
+    if (!P.air) {
+      if (gY > P.y + 0.6) { if (P.invuln <= 0) stumble(); }                       // walked into the side of a ramp
+      else if (gY < P.y - 0.05) { P.air = true; P.vy = 0; }    // ran off the end of a car or ramp
+      else P.y = gY;                                            // follow the incline / roof
+    }
+    if (P.air) {
+      P.vy -= GRAV * dt; P.y += P.vy * dt;
+      if (P.vy <= 0 && P.y <= gY) {
+        if (gY - P.y > 0.6) { P.y = Math.max(P.y, GROUND_Y); if (P.invuln <= 0) stumble(); } // clipped a ramp side mid-jump
+        else { P.y = gY; P.vy = 0; P.air = false; P.squash = 0.8; }
+      }
+    }
+    P.surface = gY;
   }
   if (P.slide > 0) P.slide -= dt;
   if (P.invuln > 0) P.invuln -= dt;
@@ -1520,7 +1591,8 @@ function placeRoach(dt) {
   r.position.set(P.x, P.y, 0);
   r.rotation.z = THREE.MathUtils.damp(r.rotation.z, lean, 12, dt);
   r.rotation.y = THREE.MathUtils.damp(r.rotation.y, (LANES[P.lane] - P.x) * 0.25, 12, dt);
-  r.rotation.x = THREE.MathUtils.damp(r.rotation.x, P.air && P.fly <= 0 ? -P.vy * 0.012 : P.fly > 0 ? -0.15 : 0, 10, dt);
+  const onRamp = !P.air && P.y > GROUND_Y + 0.05 && P.y < ROOF_Y - 0.05;
+  r.rotation.x = THREE.MathUtils.damp(r.rotation.x, P.air && P.fly <= 0 ? -P.vy * 0.012 : P.fly > 0 ? -0.15 : onRamp ? -Math.atan2(ROOF_Y, RAMP_SLOPE_L) : 0, 10, dt);
   const sq = P.slide > 0 ? 0.55 : 1;
   r.scale.set(ROACH_SCALE * (1 + (1 - sq) * 0.25), THREE.MathUtils.damp(r.scale.y, ROACH_SCALE * sq * P.squash, 18, dt), ROACH_SCALE * (1 + (1 - sq) * 0.15));
   // flash while invulnerable
@@ -1609,7 +1681,7 @@ addEventListener('orientationchange', () => setTimeout(onResize, 250));
 if (window.visualViewport) visualViewport.addEventListener('resize', onResize);
 
 function prewarm() {
-  const temp = ['train', 'train2', 'barrier', 'spray', 'fence'].map(t => { const o = getOb(t); o.g.position.set(0, 0, -20); return o; });
+  const temp = ['train', 'train2', 'barrier', 'spray', 'fence', 'ramp'].map(t => { const o = getOb(t); o.g.position.set(0, 0, -20); return o; });
   const c = getCrumb(); c.g.position.set(0, 1, -10);
   wingPU.visible = true; slipper.visible = true; slipper.position.set(0, 0, -12);
   roach.wings.forEach(w => { w.hw.visible = true; });
@@ -1626,7 +1698,7 @@ requestAnimationFrame(t => { last = t; loop(t); });
 if ('serviceWorker' in navigator && !window.Capacitor && (location.protocol === 'https:' || location.hostname === 'localhost')) {
   addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
 }
-window.__game = { S, P, startGame, moveLane, jump, slide, obstacles, crumbs, renderer, scene }; // debug handle used by the test scripts
+window.__game = { S, P, startGame, moveLane, jump, slide, obstacles, crumbs, renderer, scene, getOb, groundAt }; // debug handle used by the test scripts
 </script>
 <script>
   // surface load failures instead of a blank screen

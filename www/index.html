@@ -171,6 +171,7 @@ import { OutputPass } from './vendor/three/addons/postprocessing/OutputPass.js';
 import { ShaderPass } from './vendor/three/addons/postprocessing/ShaderPass.js';
 import { GTAOPass } from './vendor/three/addons/postprocessing/GTAOPass.js';
 import { RoundedBoxGeometry } from './vendor/three/addons/geometries/RoundedBoxGeometry.js';
+import { mergeGeometries } from './vendor/three/addons/utils/BufferGeometryUtils.js';
 
 // ───────────────────────────── constants ─────────────────────────────
 const LANES = [-2.6, 0, 2.6];
@@ -195,7 +196,7 @@ const store = {
 // ───────────────────────────── renderer ─────────────────────────────
 const canvas = $('game');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
-let dpr = Math.min(window.devicePixelRatio || 1, isTouch ? 1.35 : 1.75);
+let dpr = Math.min(window.devicePixelRatio || 1, isTouch ? 1.25 : 1.6);
 renderer.setPixelRatio(dpr);
 renderer.setSize(innerWidth, innerHeight);
 renderer.toneMapping = THREE.AgXToneMapping;   // filmic response close to a camera sensor
@@ -248,6 +249,7 @@ if (!isTouch) {
   composer.addPass(gtao);
 }
 const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.18, 0.35, 1.0);
+bloom.enabled = !isTouch;
 composer.addPass(bloom);
 composer.addPass(new OutputPass());
 // camera look: lens vignette, slight chromatic aberration at the edges, sensor grain, gentle contrast curve
@@ -272,7 +274,7 @@ const lens = new ShaderPass({
 composer.addPass(lens);
 
 // ───────────────────────────── lights ─────────────────────────────
-scene.add(new THREE.HemisphereLight(0xb7c4d6, 0x2a1e14, 0.5));
+scene.add(new THREE.HemisphereLight(0xc9b8a0, 0x2a1e14, 0.75)); // cheap ambient fill (no per-light shading cost)
 const sun = new THREE.DirectionalLight(0xffe2b8, 0.85);
 sun.castShadow = true;
 sun.shadow.mapSize.set(isTouch ? 1024 : 2048, isTouch ? 1024 : 2048);
@@ -280,9 +282,7 @@ Object.assign(sun.shadow.camera, { left: -12, right: 12, top: 16, bottom: -16, n
 sun.shadow.bias = -0.0004;
 sun.shadow.normalBias = 0.03;
 scene.add(sun, sun.target);
-// soft warm fill that travels with the roach so the hero stays readable on small screens (no shadows, cheap)
-const fill = new THREE.PointLight(0xffc690, 2.2, 7, 1.6);
-scene.add(fill);
+
 
 // ───────────────────────────── procedural textures ─────────────────────────────
 function makeCanvas(w, h, draw) {
@@ -641,7 +641,7 @@ const M = {
   spray: new THREE.MeshStandardMaterial({ map: tex(sprayC), metalness: 0.55, roughness: 0.3, envMapIntensity: 1 }),
   chrome: new THREE.MeshStandardMaterial({ color: 0xd8d8d8, metalness: 1, roughness: 0.15 }),
   whitePlastic: new THREE.MeshPhysicalMaterial({ color: 0xf0f0ea, roughness: 0.35, clearcoat: 0.5 }),
-  crumb: new THREE.MeshStandardMaterial({ map: tex(crumbC), bumpMap: tex(crumbC, 1, 1, false), bumpScale: 4, roughness: 0.9, emissive: 0x6b3a0c, emissiveIntensity: 0.35 }),
+  crumb: new THREE.MeshStandardMaterial({ map: tex(crumbC), bumpMap: tex(crumbC, 1, 1, false), bumpScale: 4, roughness: 0.9, emissive: 0x8a4a10, emissiveIntensity: 0.6 }),
   glow: new THREE.SpriteMaterial({ map: tex(glowC), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.32, fog: true }),
   // roach
   shell: new THREE.MeshPhysicalMaterial({ ...pbr('wing'), color: 0x7c5a4c, roughness: 1, clearcoat: 0.75, clearcoatRoughness: 0.28, envMapIntensity: 0.3 }),
@@ -680,6 +680,32 @@ function limbX(rt, rb, len, seg = 10) { const g = new THREE.CylinderGeometry(rt,
 // cylinder along -Z (forward)
 function limbZ(rt, rb, len, seg = 8) { const g = new THREE.CylinderGeometry(rt, rb, len, seg, 1); g.rotateX(-Math.PI / 2); g.translate(0, 0, -len / 2); return g; }
 const mesh = (g, m) => new THREE.Mesh(g, m);
+// Collapse static child meshes into one mesh per material: far fewer draw calls (the main cost on phones).
+const _inv = new THREE.Matrix4(), _rel = new THREE.Matrix4();
+function mergeStatic(root, filter = () => true) {
+  root.updateMatrixWorld(true);
+  _inv.copy(root.matrixWorld).invert();
+  const victims = [];
+  root.traverse(o => { if (o !== root && o.isMesh && !o.isInstancedMesh && !Array.isArray(o.material) && o.visible && filter(o)) victims.push(o); });
+  const buckets = new Map();
+  for (const o of victims) {
+    const key = o.material.uuid + (o.castShadow ? 'c' : '') + (o.receiveShadow ? 'r' : '');
+    const g = o.geometry.index ? o.geometry.toNonIndexed() : o.geometry.clone();
+    for (const n of Object.keys(g.attributes)) if (n !== 'position' && n !== 'normal' && n !== 'uv') g.deleteAttribute(n);
+    if (!g.attributes.uv) g.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array(g.attributes.position.count * 2), 2));
+    if (!g.attributes.normal) g.computeVertexNormals();
+    g.clearGroups(); g.morphAttributes = {};
+    g.applyMatrix4(_rel.multiplyMatrices(_inv, o.matrixWorld));
+    if (!buckets.has(key)) buckets.set(key, { m: o.material, cast: o.castShadow, recv: o.receiveShadow, geos: [] });
+    buckets.get(key).geos.push(g);
+  }
+  for (const o of victims) o.parent.remove(o);
+  for (const b of buckets.values()) {
+    const merged = mergeGeometries(b.geos); b.geos.forEach(g => g.dispose());
+    const m = new THREE.Mesh(merged, b.m); m.castShadow = b.cast; m.receiveShadow = b.recv; root.add(m);
+  }
+  return root;
+}
 
 // ───────────────────────────── cockroach ─────────────────────────────
 const SPINE_GEO = new THREE.ConeGeometry(0.0035, 0.055, 4).translate(0, 0.0275, 0);
@@ -688,7 +714,7 @@ function buildRoach() {
   const body = new THREE.Group(); root.add(body); // bobbing / squash
 
   // pronotum shield
-  const pg = ellipsoid(0.3, 0.075, 0.24, 40, 20); planarUV(pg, 'x', 'z');
+  const pg = ellipsoid(0.3, 0.075, 0.24, 28, 14); planarUV(pg, 'x', 'z');
   const pron = mesh(pg, M.pronotum); pron.position.set(0, 0.33, -0.46); pron.rotation.x = 0.14; body.add(pron);
 
   // head (tucked under the shield, facing down-forward)
@@ -703,11 +729,11 @@ function buildRoach() {
   for (const s of [-1, 1]) {
     let parent = new THREE.Group(); parent.position.set(s * 0.05, 0.27, -0.74); parent.rotation.set(0.35, s * 0.32, 0); body.add(parent);
     const segs = [];
-    const N = 30;
+    const N = 14;
     for (let i = 0; i < N; i++) {
-      const len = i < 2 ? 0.05 : 0.058, r0 = 0.0085 * (1 - i / N) + 0.0018, r1 = 0.0085 * (1 - (i + 1) / N) + 0.0018;
+      const len = i < 2 ? 0.08 : 0.125, r0 = 0.0085 * (1 - i / N) + 0.0018, r1 = 0.0085 * (1 - (i + 1) / N) + 0.0018;
       const seg = new THREE.Group(); if (i) seg.position.z = -len;
-      seg.add(mesh(limbZ(r1, r0, len, 6), M.leg));
+      { const am = mesh(limbZ(r1, r0, len, 5), M.leg); am.userData.noShadow = true; seg.add(am); }
       parent.add(seg); segs.push(seg); parent = seg;
     }
     antennae.push({ segs, s });
@@ -717,9 +743,9 @@ function buildRoach() {
   const thorax = mesh(ellipsoid(0.15, 0.08, 0.3), M.chitin); thorax.position.set(0, 0.22, -0.28); body.add(thorax);
 
   // abdomen segments
-  const abd = new THREE.Group(); body.add(abd);
+  const abd = new THREE.Group(); body.add(abd); const roach_abd = abd;
   for (let i = 0; i < 7; i++) {
-    const t = i / 6, g = ellipsoid(0.24 * (1 - t * 0.45), 0.075 * (1 - t * 0.3), 0.12, 28, 14); planarUV(g, 'x', 'z');
+    const t = i / 6, g = ellipsoid(0.24 * (1 - t * 0.45), 0.075 * (1 - t * 0.3), 0.12, 18, 8); planarUV(g, 'x', 'z');
     const m = mesh(g, M.abdomen); m.position.set(0, 0.24 - t * 0.04, -0.05 + i * 0.12); abd.add(m);
   }
   // cerci
@@ -731,7 +757,7 @@ function buildRoach() {
   const wings = [];
   for (const s of [-1, 1]) {
     const pivot = new THREE.Group(); pivot.position.set(s * 0.04, 0.36, -0.26); body.add(pivot);
-    const g = ellipsoid(0.17, 0.026, 0.68, 48, 24);
+    const g = ellipsoid(0.17, 0.026, 0.68, 30, 16);
     { // drape the wing over the abdomen: outer edge curls down, tip flattens
       const p = g.attributes.position;
       for (let i = 0; i < p.count; i++) { const x = p.getX(i), z = p.getZ(i); p.setY(i, p.getY(i) - 2.4 * x * x * (1 - 0.3 * z / 0.68) - (s * x > 0 ? 0.6 * x * x : 0)); }
@@ -778,11 +804,16 @@ function buildRoach() {
     const claw = mesh(SPINE_GEO, M.chitin); claw.scale.setScalar(0.45); claw.position.x = c.tarsus / 5; claw.rotation.z = -2.2; tp.add(claw);
     // tripod gait: R-front, L-mid, R-hind vs the others
     const group = (s === 1 ? c.a : 1 - c.a);
-    legs.push({ yaw, fem, tib, base: c, group, i });
+    legs.push({ yaw, fem, tib, tar, base: c, group, i });
   });
 
   shadowAll(root, true, false);
+  root.traverse(o => { if (o.userData.noShadow) o.castShadow = false; });
   wings.forEach(w => { w.hw.castShadow = false; });
+  // rigid sub-assemblies become single meshes (spines into tibiae, tarsal joints into one foot, abdomen rings)
+  for (const L of legs) { mergeStatic(L.tib, o => o.parent === L.tib); mergeStatic(L.tar); mergeStatic(L.fem, o => o.parent === L.fem); }
+  mergeStatic(roach_abd);
+  mergeStatic(head);
   return { root, body, wings, legs, antennae, head };
 }
 const roach = buildRoach();
@@ -808,8 +839,8 @@ function animateRoach(t, dt, runRate, mode) {
   }
   for (const A of antennae) A.segs.forEach((seg, i) => {
     const wob = mode === 'idle' ? 0.05 : 0.025;
-    seg.rotation.x = (i ? -0.028 : 0) + Math.sin(t * 3.2 + i * 0.3 + A.s) * wob * 0.6 + (mode === 'run' || mode === 'slide' ? 0.008 : 0);
-    seg.rotation.y = (i ? A.s * 0.016 : 0) + Math.cos(t * 2.6 + i * 0.25) * wob * 0.5;
+    seg.rotation.x = (i ? -0.06 : 0) + Math.sin(t * 3.2 + i * 0.6 + A.s) * wob * 1.1 + (mode === 'run' || mode === 'slide' ? 0.017 : 0);
+    seg.rotation.y = (i ? A.s * 0.034 : 0) + Math.cos(t * 2.6 + i * 0.5) * wob * 0.9;
   });
   const flying = mode === 'fly';
   for (const W of wings) {
@@ -842,11 +873,11 @@ function railProfileGeometry(len) {
 const TUNNEL_W = 6.4, WALL_H = 2.9;
 const G = {
   ballast: new THREE.PlaneGeometry(TUNNEL_W * 2, CH_L).rotateX(-Math.PI / 2),
-  sleeper: new RoundedBoxGeometry(2.5, 0.14, 0.26, 2, 0.025),
+  sleeper: new RoundedBoxGeometry(2.5, 0.14, 0.26, 1, 0.02),
   railBase: railProfileGeometry(CH_L),
   railTop: new THREE.BoxGeometry(0.058, 0.014, CH_L),
   plate: new THREE.BoxGeometry(0.2, 0.025, 0.3),
-  clip: new THREE.TorusGeometry(0.035, 0.012, 6, 10, Math.PI),
+  clip: new THREE.BoxGeometry(0.025, 0.07, 0.09),
   stone: (() => { // a chunky, faceted piece of crushed granite
     const g = new THREE.IcosahedronGeometry(0.06, 0); const p = g.attributes.position, v = new THREE.Vector3();
     for (let i = 0; i < p.count; i++) { v.fromBufferAttribute(p, i); const k = 0.8 + 0.4 * Math.abs(Math.sin(v.x * 91 + v.y * 37 + v.z * 53)); p.setXYZ(i, v.x * k * 1.2, v.y * k * 0.75, v.z * k); }
@@ -866,12 +897,13 @@ const G = {
   poster: new THREE.PlaneGeometry(1.0, 1.4),
 };
 const SLEEPER_STEP = 0.85, SLEEPERS_PER_LANE = Math.floor(CH_L / SLEEPER_STEP);
-const STONES_PER_CHUNK = isTouch ? 380 : 900;
+const STONES_PER_CHUNK = isTouch ? 260 : 700;
 // lamp light shaft: soft cone, brighter near the lamp, made visible by the tunnel dust
 const beamMat = new THREE.MeshBasicMaterial({
   map: tex(makeCanvas(8, 128, (g, w, h) => { const gr = g.createLinearGradient(0, 0, 0, h); gr.addColorStop(0, 'rgba(255,190,110,0.9)'); gr.addColorStop(1, 'rgba(255,190,110,0)'); g.fillStyle = gr; g.fillRect(0, 0, w, h); })),
   transparent: true, opacity: 0.045, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: true });
 const chunks = []; let chunkCount = 0;
+const posterMats = posterTexs.map(t => new THREE.MeshStandardMaterial({ map: t, roughness: 0.6 }));
 function buildChunk() {
   const c = new THREE.Group();
   const ballast = mesh(G.ballast, M.ballast); ballast.receiveShadow = true; c.add(ballast);
@@ -893,7 +925,7 @@ function buildChunk() {
     q.identity(); m4.compose(new THREE.Vector3(x, 0.128, z), q, one); plates.setMatrixAt(kp++, m4);
     for (const cs of [-1, 1]) { e.set(0, cs > 0 ? 0 : Math.PI, Math.PI / 2); q.setFromEuler(e); m4.compose(new THREE.Vector3(x + cs * 0.06, 0.15, z), q, one); clips.setMatrixAt(kc++, m4); }
   }
-  plates.receiveShadow = true; clips.castShadow = true; c.add(plates, clips);
+  plates.receiveShadow = true; clips.castShadow = false; c.add(plates, clips);
   for (const lx of LANES) for (const s of [-1, 1]) {
     const rb = mesh(G.railBase, M.railBase); rb.position.set(lx + s * 0.72, 0.14, 0); rb.castShadow = true; rb.receiveShadow = true; c.add(rb);
     const rt = mesh(G.railTop, M.railTop); rt.position.set(lx + s * 0.72, 0.14 + 0.1838 + 0.003, 0); // polished running band sits proud of the head, no coplanar faces c.add(rt);
@@ -933,8 +965,9 @@ function buildChunk() {
   if (!isTouch || chunkCount % 2 === 0) { light = new THREE.PointLight(0xffb866, isTouch ? 26 : 18, 24, 1.8); light.position.x = 0.8; lamp.add(light); }
   chunkCount++;
   c.add(lamp);
+  mergeStatic(c, o => o.parent === c);   // rails, walls, cables, pipes, arch, tubes -> one mesh per material
   const puddle = mesh(G.puddle, M.puddle); puddle.position.y = 0.015; c.add(puddle);
-  const poster = mesh(G.poster, new THREE.MeshStandardMaterial({ roughness: 0.6 })); poster.receiveShadow = true; c.add(poster);
+  const poster = mesh(G.poster, posterMats[0]); poster.receiveShadow = true; c.add(poster);
   scene.add(c);
   const ch = { g: c, lamp, light, glass: lg, beam, puddle, poster, flicker: false };
   dressChunk(ch);
@@ -951,7 +984,7 @@ function dressChunk(ch) {
   ch.puddle.visible = Math.random() < 0.6;
   ch.poster.visible = Math.random() < 0.55;
   if (ch.poster.visible) {
-    const ps = -side; ch.poster.material.map = pick(posterTexs); ch.poster.material.needsUpdate = true;
+    const ps = -side; ch.poster.material = pick(posterMats); // swap prebuilt materials: no shader re-validation
     ch.poster.position.set(ps * (TUNNEL_W - 0.05), 1.55, rand(-9, 9)); ch.poster.rotation.y = -ps * Math.PI / 2;
   }
 }
@@ -1004,7 +1037,8 @@ function buildTrain(len) {
   }
   const bump = mesh(TG.bumper, M.darkMetal); bump.position.set(0, 0.6, fz + 0.12); g.add(bump);
   shadowAll(g, true, true);
-  return g;
+  g.traverse(o => { if (o.isMesh && (o.material === M.window || o.material === M.headlight || o.material === M.glass || o.material === M.destSign)) o.castShadow = false; });
+  return mergeStatic(g);
 }
 function buildBarrier() {
   const g = new THREE.Group();
@@ -1015,7 +1049,7 @@ function buildBarrier() {
   }
   const lamp = mesh(new THREE.SphereGeometry(0.07, 12, 8), new THREE.MeshStandardMaterial({ color: 0xff7a1a, emissive: 0xff6a00, emissiveIntensity: 6 }));
   lamp.position.set(0.95, 0.9, 0); g.add(lamp); g.userData.lamp = lamp;
-  shadowAll(g); return g;
+  shadowAll(g); return mergeStatic(g, o => o !== lamp);
 }
 function buildSpray() {
   const g = new THREE.Group(); const can = new THREE.Group(); g.add(can);
@@ -1027,7 +1061,7 @@ function buildSpray() {
   // leaking puddle of poison
   const pd = mesh(G.puddle, new THREE.MeshPhysicalMaterial({ color: 0x6f7a1a, roughness: 0.05, clearcoat: 1, transparent: true, opacity: 0.7 }));
   pd.scale.set(0.9, 1, 0.7); pd.position.set(0.7, 0.02, 0.4); g.add(pd);
-  shadowAll(g); return g;
+  shadowAll(g); pd.castShadow = false; return mergeStatic(g);
 }
 function buildFence() {
   const g = new THREE.Group();
@@ -1041,7 +1075,7 @@ function buildFence() {
   })), roughness: 0.5, side: THREE.DoubleSide }));
   sign.position.set(0, 2.3, 0.03); g.add(sign);
   for (const s of [-1, 1]) { const ch = mesh(new THREE.CylinderGeometry(0.02, 0.02, 4, 6), M.darkMetal); ch.position.set(s * 1.0, 5.3, 0); g.add(ch); }
-  shadowAll(g); return g;
+  shadowAll(g); return mergeStatic(g);
 }
 
 const OB_TYPES = {
@@ -1074,8 +1108,7 @@ const crumbs = [], crumbPool = [];
 function getCrumb() {
   let c = crumbPool.pop();
   if (!c) {
-    const g = new THREE.Group(); const m = mesh(pick(crumbGeos), M.crumb); m.castShadow = true; g.add(m);
-    const s = new THREE.Sprite(M.glow); s.scale.set(0.9, 0.9, 1); g.add(s);
+    const g = new THREE.Group(); const m = mesh(pick(crumbGeos), M.crumb); g.add(m); // no glow sprite / shadow: 1 draw call per crumb
     c = { g, m }; scene.add(g);
   }
   c.g.visible = true; c.m.rotation.set(rand(0, 6), rand(0, 6), 0); crumbs.push(c); return c;
@@ -1091,7 +1124,6 @@ function buildWingPU() {
   const core = mesh(ellipsoid(0.08, 0.08, 0.22), M.shell); core.rotation.x = Math.PI / 2; g.add(core);
   const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: M.glow.map, color: 0xffd080, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false, opacity: 0.9 }));
   glow.scale.set(2.2, 2.2, 1); g.add(glow);
-  const l = new THREE.PointLight(0xffb850, 8, 6, 2); g.add(l);
   scene.add(g); g.visible = false; return g;
 }
 const wingPU = buildWingPU();
@@ -1459,8 +1491,9 @@ function update(dt) {
   S.score = S.dist * 1 + S.crumbs * 10;
 
   // ── HUD ──
-  ui.score.textContent = Math.floor(S.score).toLocaleString('tr-TR');
-  ui.crumbs.textContent = S.crumbs;
+  const sc = Math.floor(S.score / 5) * 5;
+  if (sc !== ui.lastScore) { ui.lastScore = sc; ui.score.textContent = sc.toLocaleString('tr-TR'); }
+  if (S.crumbs !== ui.lastCrumbs) { ui.lastCrumbs = S.crumbs; ui.crumbs.textContent = S.crumbs; }
   ui.power.hidden = !(P.fly > 0); if (P.fly > 0) ui.powerBar.style.width = (P.fly / FLY_TIME * 100).toFixed(1) + '%';
   ui.warn.hidden = !(S.chase > 0);
 
@@ -1523,7 +1556,6 @@ function updateCamera(dt) {
   else if (camera.view && camera.view.enabled) camera.clearViewOffset();
   // shadow light follows
   sun.position.set(3, 13, -3); sun.target.position.set(0, 0, -7);
-  fill.position.set(P.x + 0.6, P.y + 1.8, 1.6);
   // fov kick with speed
   const fov = (S.state === 'play' ? 62 + (S.speed - MIN_SPEED) * 0.35 : 55) + portraitness() * 12;
   if (Math.abs(camera.fov - fov) > 0.05) { camera.fov = THREE.MathUtils.damp(camera.fov, fov, 3, dt); camera.updateProjectionMatrix(); }
@@ -1535,7 +1567,7 @@ function degradeQuality() {
   if (dpr > 0.75) { dpr = Math.max(0.75, dpr - 0.2); renderer.setPixelRatio(dpr); composer.setPixelRatio(dpr); }
   else if (gtao && gtao.enabled) gtao.enabled = false;
   else if (bloom.enabled) bloom.enabled = false;
-  else if (renderer.shadowMap.enabled) { renderer.shadowMap.enabled = false; scene.traverse(o => { if (o.material) [].concat(o.material).forEach(m => m.needsUpdate = true); }); }
+  else if (msaaTarget.samples > 0) { msaaTarget.samples = 0; composer.renderTarget1.samples = 0; composer.renderTarget2.samples = 0; msaaTarget.dispose(); composer.renderTarget1.dispose(); composer.renderTarget2.dispose(); }
 }
 function loop(now) {
   requestAnimationFrame(loop);
@@ -1576,6 +1608,17 @@ addEventListener('resize', onResize);
 addEventListener('orientationchange', () => setTimeout(onResize, 250));
 if (window.visualViewport) visualViewport.addEventListener('resize', onResize);
 
+function prewarm() {
+  const temp = ['train', 'train2', 'barrier', 'spray', 'fence'].map(t => { const o = getOb(t); o.g.position.set(0, 0, -20); return o; });
+  const c = getCrumb(); c.g.position.set(0, 1, -10);
+  wingPU.visible = true; slipper.visible = true; slipper.position.set(0, 0, -12);
+  roach.wings.forEach(w => { w.hw.visible = true; });
+  try { renderer.compile(scene, camera); composer.render(); } catch (e) {}
+  for (const o of temp) freeOb(o); obstacles.length = 0;
+  freeCrumb(c); crumbs.length = 0;
+  wingPU.visible = false; slipper.visible = false; roach.wings.forEach(w => { w.hw.visible = false; });
+}
+prewarm();
 $('bestMenu').textContent = S.best.toLocaleString('tr-TR');
 show('menu', true);
 $('loading').remove();
@@ -1583,7 +1626,7 @@ requestAnimationFrame(t => { last = t; loop(t); });
 if ('serviceWorker' in navigator && !window.Capacitor && (location.protocol === 'https:' || location.hostname === 'localhost')) {
   addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
 }
-window.__game = { S, P, startGame, moveLane, jump, slide, obstacles, crumbs };
+window.__game = { S, P, startGame, moveLane, jump, slide, obstacles, crumbs, renderer, scene }; // debug handle used by the test scripts
 </script>
 <script>
   // surface load failures instead of a blank screen
